@@ -25,6 +25,7 @@ pub struct NrSettings {
     pub automask: bool,
     pub white: f32,
     pub network: String,
+    pub temporal: bool,
 }
 
 impl Default for NrSettings {
@@ -40,6 +41,7 @@ impl Default for NrSettings {
             automask: *super::AUTOMASK,
             white: *super::WHITE,
             network: super::NETWORK.clone(),
+            temporal: true,
         };
         if let Some(home) = fnv_install::EngineHome::user() {
             if let Ok(text) = std::fs::read_to_string(home.root.join("nr-settings.ini")) {
@@ -56,6 +58,7 @@ impl Default for NrSettings {
                         "automask" => s.automask = v == "1",
                         "white" => s.white = v.parse().unwrap_or(s.white),
                         "network" => s.network = v.to_string(),
+                        "temporal" => s.temporal = v == "1",
                         _ => {}
                     }
                 }
@@ -69,8 +72,8 @@ impl NrSettings {
     fn save(&self) {
         let Some(home) = fnv_install::EngineHome::user() else { return };
         let text = format!(
-            "enabled={}\nstyle={}\nintensity={}\ntone={}\nstructure={}\nskin={}\nautomask={}\nwhite={}\nnetwork={}\n",
-            u8::from(self.enabled), self.style, self.intensity, self.tone, self.structure, self.skin, u8::from(self.automask), self.white, self.network
+            "enabled={}\nstyle={}\nintensity={}\ntone={}\nstructure={}\nskin={}\nautomask={}\nwhite={}\nnetwork={}\ntemporal={}\n",
+            u8::from(self.enabled), self.style, self.intensity, self.tone, self.structure, self.skin, u8::from(self.automask), self.white, self.network, u8::from(self.temporal)
         );
         let _ = std::fs::write(home.root.join("nr-settings.ini"), text);
     }
@@ -217,6 +220,7 @@ fn draw(mut contexts: EguiContexts, mut s: ResMut<NrSettings>, mut warned: Local
             ui.add(egui::Slider::new(&mut s.structure, 0.0..=4.0).text("localStructure"));
             ui.add(egui::Slider::new(&mut s.skin, -1.0..=4.0).text("skinStructure (-1 = follow)"));
             ui.checkbox(&mut s.automask, "autoMask (the network's own masking)");
+            ui.checkbox(&mut s.temporal, "Temporal history (stabilizes flicker)");
             ui.add(egui::Slider::new(&mut s.white, 0.1..=8.0).text("Paper white").logarithmic(true));
             ui.separator();
             ui.horizontal(|ui| {

@@ -292,6 +292,7 @@ struct NrSettingsRender {
     automask: bool,
     white: f32,
     network: String,
+    temporal: bool,
 }
 
 fn extract_settings(mut commands: Commands, s: Extract<Res<overlay::NrSettings>>) {
@@ -305,6 +306,7 @@ fn extract_settings(mut commands: Commands, s: Extract<Res<overlay::NrSettings>>
         automask: s.automask,
         white: s.white,
         network: s.network.clone(),
+        temporal: s.temporal,
     });
 }
 
@@ -618,8 +620,10 @@ fn nr_pass(
         .and_then(|p| p.motion_vectors.as_ref())
         .map(|m| std::ops::Deref::deref(&m.texture.default_view))
         .unwrap_or(state.dummy_motion_view.as_ref().expect("sized"));
-    let jitter_delta = (state.prev_jitter - jitter.offset) / size.as_vec2();
-    let history_valid = u32::from(state.history_primed && !prepared.reset);
+    // TemporalJitter.offset is minus the applied jitter (the engine passes -jitter to
+    // Streamline), so (j_prev - j_cur) = (offset_cur - offset_prev).
+    let jitter_delta = (jitter.offset - state.prev_jitter) / size.as_vec2();
+    let history_valid = u32::from(state.history_primed && !prepared.reset && settings.temporal);
     let prev_parity = (state.parity ^ 1) as usize;
     let next_parity = state.parity as usize;
 
