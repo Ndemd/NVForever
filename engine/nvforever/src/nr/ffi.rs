@@ -100,6 +100,7 @@ pub type NrPreprocess = unsafe extern "C" fn(
 ) -> i32;
 pub type NrRecord = unsafe extern "C" fn(*mut c_void, vk::CommandBuffer, *mut c_char, usize) -> i32;
 pub type NrHead = unsafe extern "C" fn(*mut c_void) -> vk::Buffer;
+pub type NrFeatures = unsafe extern "C" fn(*mut c_void) -> vk::Buffer;
 pub type NrDim = unsafe extern "C" fn(*mut c_void) -> u32;
 pub type NrBlendScale = unsafe extern "C" fn(*mut c_void) -> f32;
 pub type NrChainTimeouts = unsafe extern "C" fn(*mut c_void) -> u32;
@@ -115,6 +116,7 @@ pub struct Api {
     pub preprocess: NrPreprocess,
     pub record: NrRecord,
     pub head: NrHead,
+    pub features: NrFeatures,
     pub full_width: NrDim,
     pub full_height: NrDim,
     pub valid_width: NrDim,
@@ -161,6 +163,7 @@ pub unsafe fn load(folder: &std::path::Path) -> Result<Api, String> {
         preprocess: proc!(c"nr_preprocess", NrPreprocess),
         record: proc!(c"nr_record", NrRecord),
         head: proc!(c"nr_head", NrHead),
+        features: proc!(c"nr_features", NrFeatures),
         full_width: proc!(c"nr_full_width", NrDim),
         full_height: proc!(c"nr_full_height", NrDim),
         valid_width: proc!(c"nr_valid_width", NrDim),

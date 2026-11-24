@@ -214,6 +214,18 @@ impl Plugin for NrInitPlugin {
             composite_params: None,
             encode_pipeline: None,
             composite_pipeline: None,
+            history: Vec::new(),
+            history_views: Vec::new(),
+            parity: 0,
+            history_primed: false,
+            prev_jitter: Vec2::ZERO,
+            features: None,
+            preprocess_pipeline: None,
+            preprocess_params: None,
+            sampler: None,
+            dummy_motion: None,
+            dummy_motion_view: None,
+            blend_scale: unsafe { (api.blend_scale)(handle) },
             frame: 0,
             failed: false,
         });
@@ -241,6 +253,21 @@ struct NrState {
     composite_params: Option<wgpu::Buffer>,
     encode_pipeline: Option<wgpu::ComputePipeline>,
     composite_pipeline: Option<wgpu::ComputePipeline>,
+    /// Temporal path: ping-pong history surfaces (proxy code space, half grid), the parity of
+    /// the next write, and whether a history exists at all yet.
+    history: Vec<wgpu::Texture>,
+    history_views: Vec<wgpu::TextureView>,
+    parity: u32,
+    history_primed: bool,
+    prev_jitter: Vec2,
+    features: Option<wgpu::Buffer>,
+    preprocess_pipeline: Option<wgpu::ComputePipeline>,
+    preprocess_params: Option<wgpu::Buffer>,
+    sampler: Option<wgpu::Sampler>,
+    /// A zero motion texture for frames without a prepass (temporal path off then).
+    dummy_motion: Option<wgpu::Texture>,
+    dummy_motion_view: Option<wgpu::TextureView>,
+    blend_scale: f32,
     frame: u32,
     failed: bool,
 }
@@ -336,6 +363,13 @@ fn reopen(state: &mut NrState, network: &str) -> bool {
     state.full = UVec2::ZERO;
     state.proxy = None;
     state.head_copy = None;
+    state.history.clear();
+    state.history_views.clear();
+    state.parity = 0;
+    state.history_primed = false;
+    state.features = None;
+    state.preprocess_pipeline = None;
+    state.blend_scale = unsafe { (state.api.blend_scale)(state.handle) };
     note(Level::INFO, format!("network switched to {network}"));
     true
 }
@@ -351,6 +385,27 @@ struct EncodeParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct PreprocessParams {
+    full_width: u32,
+    full_height: u32,
+    valid_width: u32,
+    valid_height: u32,
+    seed: u32,
+    history_valid: u32,
+    style: f32,
+    tone: f32,
+    structure: f32,
+    skin: f32,
+    automask: f32,
+    jitter_dx: f32,
+    jitter_dy: f32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct CompositeParams {
     width: u32,
     height: u32,
@@ -361,6 +416,10 @@ struct CompositeParams {
     intensity: f32,
     style: f32,
     local_tone: f32,
+    blend_scale: f32,
+    jitter_dx: f32,
+    jitter_dy: f32,
+    history_valid: u32,
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
@@ -372,7 +431,7 @@ fn bytes_of<T: Copy>(value: &T) -> &[u8] {
 }
 
 /// Rebuilds the per-size buffers and pipelines (once per resolution).
-fn prepare_size(state: &mut NrState, device: &wgpu::Device, size: UVec2) -> bool {
+fn prepare_size(state: &mut NrState, device: &wgpu::Device, queue: &wgpu::Queue, size: UVec2) -> bool {
     let mut err = [0i8; 1024];
     // SAFETY: the handle is open; resize drains the library's own queue work first.
     let ok = unsafe { (state.api.resize)(state.handle, size.x, size.y, err.as_mut_ptr(), err.len()) };
@@ -407,7 +466,8 @@ fn prepare_size(state: &mut NrState, device: &wgpu::Device, size: UVec2) -> bool
         mapped_at_creation: false,
     });
     let encode_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("nr_encode"), source: wgpu::ShaderSource::Wgsl(shaders::encode_source().into()) });
-    let composite_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("nr_composite"), source: wgpu::ShaderSource::Wgsl(shaders::COMPOSITE.into()) });
+    let composite_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("nr_composite"), source: wgpu::ShaderSource::Wgsl(shaders::composite_source().into()) });
+    let preprocess_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("nr_preprocess"), source: wgpu::ShaderSource::Wgsl(shaders::preprocess_source().into()) });
     let encode_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("nr_encode"),
         layout: None,
@@ -424,6 +484,67 @@ fn prepare_size(state: &mut NrState, device: &wgpu::Device, size: UVec2) -> bool
         compilation_options: Default::default(),
         cache: None,
     });
+    let preprocess_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("nr_preprocess"),
+        layout: None,
+        module: &preprocess_module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let preprocess_params = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("nr_preprocess_params"),
+        size: std::mem::size_of::<PreprocessParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let features = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("nr_features"),
+        size: (full.x * full.y * 64) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("nr_history"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..default()
+    });
+    let mut history = Vec::new();
+    let mut history_views = Vec::new();
+    for i in 0..2 {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(if i == 0 { "nr_history_a" } else { "nr_history_b" }),
+            size: wgpu::Extent3d { width: size.x, height: size.y, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        history_views.push(tex.create_view(&default()));
+        history.push(tex);
+    }
+    let dummy_motion = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("nr_dummy_motion"),
+        size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rg16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let dummy_motion_view = dummy_motion.create_view(&default());
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture: &dummy_motion, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        &[0u8; 4],
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+        wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+    );
     state.size = size;
     state.full = full;
     state.proxy = Some(proxy);
@@ -432,13 +553,26 @@ fn prepare_size(state: &mut NrState, device: &wgpu::Device, size: UVec2) -> bool
     state.composite_params = Some(composite_params);
     state.encode_pipeline = Some(encode_pipeline);
     state.composite_pipeline = Some(composite_pipeline);
+    state.preprocess_pipeline = Some(preprocess_pipeline);
+    state.preprocess_params = Some(preprocess_params);
+    state.features = Some(features);
+    state.sampler = Some(sampler);
+    state.history = history;
+    state.history_views = history_views;
+    state.parity = 0;
+    state.history_primed = false;
+    state.dummy_motion = Some(dummy_motion);
+    state.dummy_motion_view = Some(dummy_motion_view);
     note(Level::INFO, format!("sized {size} -> field {full}"));
     true
 }
 
 /// The network on the DLSS camera's render rect, before the upscaler (the module comment).
+/// Temporal path: the preprocess reprojects the previous neural output with the engine's motion
+/// vectors and jitter delta; the composite blends by the network's own logit and publishes the
+/// next history (half grid, truncated).
 fn nr_pass(
-    view: ViewQuery<(&ViewTarget, &PreparedUpscale)>,
+    view: ViewQuery<(&ViewTarget, &PreparedUpscale, Option<&bevy::core_pipeline::prepass::ViewPrepassTextures>, &bevy::render::camera::TemporalJitter)>,
     mut state: Option<ResMut<NrState>>,
     settings: Res<NrSettingsRender>,
     device: Res<RenderDevice>,
@@ -457,7 +591,7 @@ fn nr_pass(
         state.failed = true;
         return;
     }
-    let (target, prepared) = view.into_inner();
+    let (target, prepared, prepass, jitter) = view.into_inner();
     let UpscaleSettings::Dlss(_) = prepared.camera.settings else {
         NR_ACTIVE.store(false, Ordering::Relaxed);
         return;
@@ -468,18 +602,26 @@ fn nr_pass(
     }
     let device = device.wgpu_device();
     if state.size != size || state.proxy.is_none() {
-        if !prepare_size(state, device, size) {
+        if !prepare_size(state, device, &queue, size) {
             state.failed = true;
             return;
         }
     }
-    let (Some(proxy), Some(head_copy), Some(encode_params), Some(composite_params), Some(encode_pipeline), Some(composite_pipeline)) =
-        (&state.proxy, &state.head_copy, &state.encode_params, &state.composite_params, &state.encode_pipeline, &state.composite_pipeline)
+    let (Some(proxy), Some(head_copy), Some(encode_params), Some(composite_params), Some(encode_pipeline), Some(composite_pipeline), Some(preprocess_pipeline), Some(preprocess_params), Some(features), Some(sampler)) =
+        (&state.proxy, &state.head_copy, &state.encode_params, &state.composite_params, &state.encode_pipeline, &state.composite_pipeline, &state.preprocess_pipeline, &state.preprocess_params, &state.features, &state.sampler)
     else {
         return;
     };
     let color_view = target.main_texture_view();
     let seed = if prepared.reset { 0 } else { state.frame };
+    let motion_view = prepass
+        .and_then(|p| p.motion_vectors.as_ref())
+        .map(|m| std::ops::Deref::deref(&m.texture.default_view))
+        .unwrap_or(state.dummy_motion_view.as_ref().expect("sized"));
+    let jitter_delta = (state.prev_jitter - jitter.offset) / size.as_vec2();
+    let history_valid = u32::from(state.history_primed && !prepared.reset);
+    let prev_parity = (state.parity ^ 1) as usize;
+    let next_parity = state.parity as usize;
 
     // 1. Encode the scene's render rect to the proxy, on Bevy's encoder.
     let encode = EncodeParams { width: size.x, height: size.y, paper_white: settings.white, exposure: 1.0 };
@@ -501,15 +643,56 @@ fn nr_pass(
         pass.dispatch_workgroups((size.x + 7) / 8, (size.y + 7) / 8, 1);
     }
 
-    // 2. The network on its own encoder, raw recording only (dlss::evaluate's pattern).
-    let raw_proxy = unsafe { proxy.as_hal::<wgpu::hal::api::Vulkan>() }.map(|b| unsafe { b.raw_handle() });
+    // 2. The temporal preprocess: 16 feature lanes per field pixel, history reprojected with
+    // the engine MVs + jitter delta, on Bevy's encoder.
+    let full = state.full;
+    let pre = PreprocessParams {
+        full_width: full.x,
+        full_height: full.y,
+        valid_width: size.x,
+        valid_height: size.y,
+        seed,
+        history_valid,
+        style: settings.style,
+        tone: settings.tone,
+        structure: settings.structure,
+        skin: settings.skin,
+        automask: if settings.automask { 1.0 } else { -1.0 },
+        jitter_dx: jitter_delta.x,
+        jitter_dy: jitter_delta.y,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
+    queue.write_buffer(preprocess_params, 0, bytes_of(&pre));
+    {
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("nr_preprocess"),
+            layout: &preprocess_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: proxy.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(motion_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&state.history_views[prev_parity]) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(sampler) },
+                wgpu::BindGroupEntry { binding: 4, resource: features.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: preprocess_params.as_entire_binding() },
+            ],
+        });
+        let encoder = ctx.command_encoder();
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("nr_preprocess"), timestamp_writes: None });
+        pass.set_pipeline(preprocess_pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((full.x + 7) / 8, (full.y + 7) / 8, 1);
+    }
+
+    // 3. The network on its own encoder, raw recording only (dlss::evaluate's pattern).
+    let raw_features = unsafe { features.as_hal::<wgpu::hal::api::Vulkan>() }.map(|b| unsafe { b.raw_handle() });
     let raw_head_copy = unsafe { head_copy.as_hal::<wgpu::hal::api::Vulkan>() }.map(|b| unsafe { b.raw_handle() });
     let raw_device = unsafe { device.as_hal::<wgpu::hal::api::Vulkan>() }.map(|d| d.raw_device().clone());
-    let (Some(raw_proxy), Some(raw_head_copy), Some(raw_device)) = (raw_proxy, raw_head_copy, raw_device) else {
+    let (Some(raw_features), Some(raw_head_copy), Some(raw_device)) = (raw_features, raw_head_copy, raw_device) else {
         state.failed = true;
         return;
     };
-    let full = state.full;
     let api = state.api;
     let handle = state.handle;
     let mut nr_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("nr_network") });
@@ -527,12 +710,11 @@ fn nr_pass(
                 };
                 full_barrier();
                 (api.reset_pools)(handle);
-                let mut err = [0i8; 1024];
-                let ok = (api.preprocess)(handle, cmd, raw_proxy, size.x, size.y, seed, settings.style, settings.tone, settings.structure, settings.skin, i32::from(settings.automask), err.as_mut_ptr(), err.len());
-                if ok == 0 {
-                    return false;
-                }
+                let nr_features = (api.features)(handle);
+                let region = vk::BufferCopy::default().size((full.x * full.y * 64) as u64);
+                raw_device.cmd_copy_buffer(cmd, raw_features, nr_features, &[region]);
                 full_barrier();
+                let mut err = [0i8; 1024];
                 let ok = (api.record)(handle, cmd, err.as_mut_ptr(), err.len());
                 if ok == 0 {
                     return false;
@@ -547,7 +729,7 @@ fn nr_pass(
         })
     };
     let command_buffer = nr_encoder.finish();
-    let kept = (target.main_texture().clone(), proxy.clone(), head_copy.clone());
+    let kept = (target.main_texture().clone(), proxy.clone(), head_copy.clone(), features.clone());
     command_buffer.on_submitted_work_done(move || drop(kept));
     ctx.add_command_buffer(command_buffer);
     if recorded != Some(true) {
@@ -560,8 +742,26 @@ fn nr_pass(
         unsafe { (api.set_chain)(0) };
     }
 
-    // 3. Compose the head back onto the scene's render rect, on Bevy's next encoder.
-    let composite = CompositeParams { width: size.x, height: size.y, full_width: full.x, full_height: full.y, paper_white: settings.white, exposure: 1.0, intensity: settings.intensity, style: settings.style, local_tone: settings.tone, _pad0: 0, _pad1: 0, _pad2: 0 };
+    // 4. Compose the head back onto the scene's render rect and publish the next history,
+    // on Bevy's next encoder.
+    let composite = CompositeParams {
+        width: size.x,
+        height: size.y,
+        full_width: full.x,
+        full_height: full.y,
+        paper_white: settings.white,
+        exposure: 1.0,
+        intensity: settings.intensity,
+        style: settings.style,
+        local_tone: settings.tone,
+        blend_scale: state.blend_scale,
+        jitter_dx: jitter_delta.x,
+        jitter_dy: jitter_delta.y,
+        history_valid,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
     queue.write_buffer(composite_params, 0, bytes_of(&composite));
     {
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -571,7 +771,11 @@ fn nr_pass(
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(color_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: head_copy.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: proxy.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: composite_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&state.history_views[prev_parity]) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(sampler) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&state.history_views[next_parity]) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(motion_view) },
+                wgpu::BindGroupEntry { binding: 7, resource: composite_params.as_entire_binding() },
             ],
         });
         let encoder = ctx.command_encoder();
@@ -580,6 +784,9 @@ fn nr_pass(
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((size.x + 7) / 8, (size.y + 7) / 8, 1);
     }
+    state.parity ^= 1;
+    state.history_primed = true;
+    state.prev_jitter = jitter.offset;
     state.frame = state.frame.wrapping_add(1);
     NR_ACTIVE.store(true, Ordering::Relaxed);
 }
